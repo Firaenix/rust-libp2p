@@ -758,7 +758,7 @@ where
         }
 
         let entry = self.connected.entry(peer).or_default();
-        if !entry.iter().any(|x| x.id == connection_id) {
+        if entry.iter().any(|x| x.id == connection_id) {
             debug!("No need to preload handler, connection already established.");
             return;
         }
