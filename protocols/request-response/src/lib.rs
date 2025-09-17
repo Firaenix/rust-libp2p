@@ -94,6 +94,7 @@ use libp2p_swarm::{
     PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use smallvec::SmallVec;
+use tracing::{debug, instrument};
 
 use crate::handler::OutboundMessage;
 
@@ -736,6 +737,7 @@ where
 
     /// Preloads a new [`Handler`] with requests that are
     /// waiting to be sent to the newly connected peer.
+    #[instrument(skip_all, fields(%peer, %connection_id, ?remote_address))]
     fn preload_new_handler(
         &mut self,
         handler: &mut Handler<TCodec>,
@@ -752,9 +754,20 @@ where
                     .insert(request.request_id);
                 handler.on_behaviour_event(request);
             }
+            debug!(?connection, "Preloading handler with outbound responses");
         }
 
-        self.connected.entry(peer).or_default().push(connection);
+        let entry = self.connected.entry(peer).or_default();
+        if !entry.iter().any(|x| x.id == connection_id) {
+            debug!("No need to preload handler, connection already established.");
+            return;
+        }
+
+        entry.push(connection);
+
+        let connections_length = self.connected.get(&peer).map_or_else(|| 0, |c| c.len());
+
+        debug!(?connections_length, "Preloaded handler");
     }
 }
 
@@ -765,13 +778,15 @@ where
     type ConnectionHandler = Handler<TCodec>;
     type ToSwarm = Event<TCodec::Request, TCodec::Response>;
 
+    #[instrument(skip_all, fields(%connection_id, %peer, local_addr = %_local_addr, remote_addr = %_remote_addr))]
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: ConnectionId,
         peer: PeerId,
-        _: &Multiaddr,
-        _: &Multiaddr,
+        _local_addr: &Multiaddr,
+        _remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
+        debug!("New inbound connection");
         let mut handler = Handler::new(
             self.inbound_protocols.clone(),
             self.codec.clone(),
@@ -1035,6 +1050,7 @@ where
 const EMPTY_QUEUE_SHRINK_THRESHOLD: usize = 100;
 
 /// Internal information tracked for an established connection.
+#[derive(Debug)]
 struct Connection {
     id: ConnectionId,
     remote_address: Option<Multiaddr>,
