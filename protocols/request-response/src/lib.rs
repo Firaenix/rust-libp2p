@@ -665,10 +665,24 @@ where
             ..
         }: ConnectionClosed,
     ) {
+        debug!(
+            peer_id = %peer_id,
+            connection_id = ?connection_id,
+            remaining = remaining_established,
+            "Cleaning up connection from request_response"
+        );
+
         let connections = self
             .connected
             .get_mut(&peer_id)
             .expect("Expected some established connection to peer before closing.");
+
+        let before_count = connections.len();
+        debug!(
+            peer_id = %peer_id,
+            connections_before = before_count,
+            "Found peer in connected map"
+        );
 
         let connection = connections
             .iter()
@@ -700,6 +714,18 @@ where
                     error: OutboundFailure::ConnectionClosed,
                 }));
         }
+
+        let after_count = self
+            .connected
+            .get_mut(&peer_id)
+            .map(|x| x.len())
+            .unwrap_or(0);
+
+        debug!(
+            peer_id = %peer_id,
+            connections_after = after_count,
+            "Removed connection"
+        );
     }
 
     fn on_dial_failure(
