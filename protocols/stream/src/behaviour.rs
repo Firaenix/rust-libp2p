@@ -107,6 +107,7 @@ impl NetworkBehaviour for Behaviour {
                     error @ (DialError::Transport(_)
                     | DialError::Denied { .. }
                     | DialError::NoAddresses
+                    | DialError::Aborted
                     | DialError::WrongPeerId { .. }),
                 ..
             }) => {

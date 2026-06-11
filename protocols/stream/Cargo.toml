@@ -9,16 +9,20 @@ repository = "https://github.com/libp2p/rust-libp2p"
 keywords = ["peer-to-peer", "libp2p", "networking"]
 categories = ["network-programming", "asynchronous"]
 
+# libp2p-* deps pinned to the published registry versions (matching the
+# crates.io 0.4.0-alpha manifest) instead of workspace path deps, so this
+# branch works as a `[patch.crates-io]` git source without dragging the whole
+# rust-libp2p workspace in as path dependencies.
 [dependencies]
 futures = { workspace = true }
-libp2p-core = { workspace = true }
-libp2p-identity = { workspace = true, features = ["peerid"] }
-libp2p-swarm = { workspace = true }
+libp2p-core = "0.43.1"
+libp2p-identity = { version = "0.2.12", features = ["peerid"] }
+libp2p-swarm = "0.47.0"
 tracing = { workspace = true }
 rand = "0.8"
 
 [dev-dependencies]
-libp2p-swarm-test = { workspace = true }
+libp2p-swarm-test = "0.6.0"
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
