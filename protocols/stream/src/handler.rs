@@ -18,15 +18,18 @@ use libp2p_swarm::{
 
 use crate::{shared::Shared, upgrade::Upgrade, OpenStreamError};
 
+/// Upper bound on outbound streams a single connection negotiates at once.
+///
+/// Each open request travels with its own negotiation, so requests no longer wait for the ones
+/// ahead of them; this only keeps a flood of requests from opening unbounded substreams.
+const MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS: usize = 128;
+
 pub struct Handler {
     remote: PeerId,
     shared: Arc<Mutex<Shared>>,
 
     receiver: mpsc::Receiver<NewStream>,
-    pending_upgrade: Option<(
-        StreamProtocol,
-        oneshot::Sender<Result<Stream, OpenStreamError>>,
-    )>,
+    outbound_negotiations: usize,
 }
 
 impl Handler {
@@ -38,7 +41,7 @@ impl Handler {
         Self {
             shared,
             receiver,
-            pending_upgrade: None,
+            outbound_negotiations: 0,
             remote,
         }
     }
@@ -50,7 +53,7 @@ impl ConnectionHandler for Handler {
     type InboundProtocol = Upgrade;
     type OutboundProtocol = Upgrade;
     type InboundOpenInfo = ();
-    type OutboundOpenInfo = ();
+    type OutboundOpenInfo = NewStream;
 
     fn listen_protocol(&self) -> swarm::SubstreamProtocol<Self::InboundProtocol> {
         swarm::SubstreamProtocol::new(
@@ -64,28 +67,28 @@ impl ConnectionHandler for Handler {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<swarm::ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
-        if self.pending_upgrade.is_some() {
+    ) -> Poll<swarm::ConnectionHandlerEvent<Self::OutboundProtocol, NewStream, Self::ToBehaviour>>
+    {
+        if self.outbound_negotiations >= MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS {
             return Poll::Pending;
         }
 
         match self.receiver.poll_next_unpin(cx) {
             Poll::Ready(Some(new_stream)) => {
-                self.pending_upgrade = Some((new_stream.protocol.clone(), new_stream.sender));
-                return Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest {
+                self.outbound_negotiations += 1;
+                let supported_protocols = vec![new_stream.protocol.clone()];
+                Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest {
                     protocol: swarm::SubstreamProtocol::new(
                         Upgrade {
-                            supported_protocols: vec![new_stream.protocol],
+                            supported_protocols,
                         },
-                        (),
+                        new_stream,
                     ),
-                });
+                })
             }
-            Poll::Ready(None) => {} // Sender is gone, no more work to do.
-            Poll::Pending => {}
+            // `None`: every sender is gone, so no more work will arrive.
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
-
-        Poll::Pending
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
@@ -94,7 +97,12 @@ impl ConnectionHandler for Handler {
 
     fn on_connection_event(
         &mut self,
-        event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol>,
+        event: ConnectionEvent<
+            Self::InboundProtocol,
+            Self::OutboundProtocol,
+            Self::InboundOpenInfo,
+            Self::OutboundOpenInfo,
+        >,
     ) {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
@@ -105,27 +113,22 @@ impl ConnectionHandler for Handler {
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: (stream, actual_protocol),
-                info: (),
+                info: new_stream,
             }) => {
-                let Some((expected_protocol, sender)) = self.pending_upgrade.take() else {
-                    debug_assert!(
-                        false,
-                        "Negotiated an outbound stream without a back channel"
-                    );
-                    return;
-                };
-                debug_assert_eq!(expected_protocol, actual_protocol);
+                self.outbound_negotiations = self.outbound_negotiations.saturating_sub(1);
+                debug_assert_eq!(new_stream.protocol, actual_protocol);
 
-                let _ = sender.send(Ok(stream));
+                let _ = new_stream.sender.send(Ok(stream));
             }
-            ConnectionEvent::DialUpgradeError(DialUpgradeError { error, info: () }) => {
-                let Some((p, sender)) = self.pending_upgrade.take() else {
-                    debug_assert!(
-                        false,
-                        "Received a `DialUpgradeError` without a back channel"
-                    );
-                    return;
-                };
+            ConnectionEvent::DialUpgradeError(DialUpgradeError {
+                error,
+                info: new_stream,
+            }) => {
+                self.outbound_negotiations = self.outbound_negotiations.saturating_sub(1);
+                let NewStream {
+                    protocol: p,
+                    sender,
+                } = new_stream;
 
                 let error = match error {
                     swarm::StreamUpgradeError::Timeout => {
@@ -147,8 +150,62 @@ impl ConnectionHandler for Handler {
 
 /// Message from a [`Control`](crate::Control) to
 /// a [`ConnectionHandler`] to negotiate a new outbound stream.
+///
+/// It is also the negotiation's open info, so the result finds its requester however many
+/// negotiations are in flight.
 #[derive(Debug)]
-pub(crate) struct NewStream {
+pub struct NewStream {
     pub(crate) protocol: StreamProtocol,
     pub(crate) sender: oneshot::Sender<Result<Stream, OpenStreamError>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::task::noop_waker_ref;
+
+    use super::*;
+
+    fn handler_with_requests(count: usize) -> Handler {
+        let (dial_sender, _dial_receiver) = mpsc::channel(0);
+        let shared = Arc::new(Mutex::new(Shared::new(dial_sender)));
+        let (mut requests, receiver) = mpsc::channel(count);
+        for _ in 0..count {
+            let (sender, _reply) = oneshot::channel();
+            requests
+                .try_send(NewStream {
+                    protocol: StreamProtocol::new("/test"),
+                    sender,
+                })
+                .unwrap();
+        }
+        Handler::new(PeerId::random(), shared, receiver)
+    }
+
+    fn requested_negotiations(handler: &mut Handler) -> usize {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut requested = 0;
+        while let Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest { .. }) =
+            handler.poll(&mut cx)
+        {
+            requested += 1;
+        }
+        requested
+    }
+
+    #[test]
+    fn queued_requests_negotiate_at_the_same_time() {
+        let mut handler = handler_with_requests(8);
+
+        assert_eq!(requested_negotiations(&mut handler), 8);
+    }
+
+    #[test]
+    fn concurrent_negotiations_are_capped() {
+        let mut handler = handler_with_requests(MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS + 5);
+
+        assert_eq!(
+            requested_negotiations(&mut handler),
+            MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS
+        );
+    }
 }
