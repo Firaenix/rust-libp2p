@@ -69,26 +69,31 @@ impl ConnectionHandler for Handler {
     {
         // The connection polls its handler again after every negotiation result, so reaching the
         // limit needs no waker.
-        if self.negotiating_outbound_streams >= self.max_negotiating_outbound_streams.get() {
-            return Poll::Pending;
+        while self.negotiating_outbound_streams < self.max_negotiating_outbound_streams.get() {
+            let Poll::Ready(Some(new_stream)) = self.receiver.poll_next_unpin(cx) else {
+                return Poll::Pending;
+            };
+            if new_stream.sender.is_canceled() {
+                tracing::debug!(
+                    protocol = %new_stream.protocol,
+                    "Caller stopped waiting, not negotiating stream"
+                );
+                continue;
+            }
+
+            self.negotiating_outbound_streams += 1;
+            let supported_protocols = vec![new_stream.protocol.clone()];
+            return Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest {
+                protocol: swarm::SubstreamProtocol::new(
+                    Upgrade {
+                        supported_protocols,
+                    },
+                    new_stream,
+                ),
+            });
         }
 
-        match self.receiver.poll_next_unpin(cx) {
-            Poll::Ready(Some(new_stream)) => {
-                self.negotiating_outbound_streams += 1;
-                let supported_protocols = vec![new_stream.protocol.clone()];
-                Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest {
-                    protocol: swarm::SubstreamProtocol::new(
-                        Upgrade {
-                            supported_protocols,
-                        },
-                        new_stream,
-                    ),
-                })
-            }
-            // `None`: every sender is gone, so no more work will arrive.
-            Poll::Ready(None) | Poll::Pending => Poll::Pending,
-        }
+        Poll::Pending
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
@@ -169,25 +174,30 @@ mod tests {
 
     const MAX_NEGOTIATING_OUTBOUND_STREAMS: usize = 128;
 
-    fn handler_with_requests(count: usize) -> Handler {
+    type Reply = oneshot::Receiver<Result<Stream, OpenStreamError>>;
+
+    fn handler_with_requests(count: usize) -> (Handler, Vec<Reply>) {
         let (dial_sender, _dial_receiver) = mpsc::channel(0);
         let shared = Arc::new(Mutex::new(Shared::new(dial_sender)));
         let (mut requests, receiver) = mpsc::channel(count);
+        let mut replies = Vec::new();
         for _ in 0..count {
-            let (sender, _reply) = oneshot::channel();
+            let (sender, reply) = oneshot::channel();
             requests
                 .try_send(NewStream {
                     protocol: StreamProtocol::new("/test"),
                     sender,
                 })
                 .unwrap();
+            replies.push(reply);
         }
-        Handler::new(
+        let handler = Handler::new(
             PeerId::random(),
             shared,
             receiver,
             NonZeroUsize::new(MAX_NEGOTIATING_OUTBOUND_STREAMS).unwrap(),
-        )
+        );
+        (handler, replies)
     }
 
     fn requested_negotiations(handler: &mut Handler) -> usize {
@@ -203,14 +213,14 @@ mod tests {
 
     #[test]
     fn queued_requests_negotiate_at_the_same_time() {
-        let mut handler = handler_with_requests(8);
+        let (mut handler, _replies) = handler_with_requests(8);
 
         assert_eq!(requested_negotiations(&mut handler), 8);
     }
 
     #[test]
     fn concurrent_negotiations_are_capped() {
-        let mut handler = handler_with_requests(MAX_NEGOTIATING_OUTBOUND_STREAMS + 5);
+        let (mut handler, _replies) = handler_with_requests(MAX_NEGOTIATING_OUTBOUND_STREAMS + 5);
 
         assert_eq!(
             requested_negotiations(&mut handler),
