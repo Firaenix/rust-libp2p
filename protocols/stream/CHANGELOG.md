@@ -1,5 +1,8 @@
 ## 0.5.0-alpha
 
+- Negotiate outbound streams on a connection concurrently instead of one at a time, so an
+  `open_stream` no longer waits a round trip behind every request queued ahead of it. At most
+  128 negotiations run at once per connection.
 - Fix memory leak: remove the per-connection `Sender` from `Shared::senders`
   when a connection closes. Previously every established connection leaked one
   sender entry forever, growing memory unboundedly under connection churn.
