@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     io,
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
@@ -18,18 +19,13 @@ use libp2p_swarm::{
 
 use crate::{shared::Shared, upgrade::Upgrade, OpenStreamError};
 
-/// Upper bound on outbound streams a single connection negotiates at once.
-///
-/// Each open request travels with its own negotiation, so requests no longer wait for the ones
-/// ahead of them; this only keeps a flood of requests from opening unbounded substreams.
-const MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS: usize = 128;
-
 pub struct Handler {
     remote: PeerId,
     shared: Arc<Mutex<Shared>>,
 
     receiver: mpsc::Receiver<NewStream>,
-    outbound_negotiations: usize,
+    negotiating_outbound_streams: usize,
+    max_negotiating_outbound_streams: NonZeroUsize,
 }
 
 impl Handler {
@@ -37,11 +33,13 @@ impl Handler {
         remote: PeerId,
         shared: Arc<Mutex<Shared>>,
         receiver: mpsc::Receiver<NewStream>,
+        max_negotiating_outbound_streams: NonZeroUsize,
     ) -> Self {
         Self {
             shared,
             receiver,
-            outbound_negotiations: 0,
+            negotiating_outbound_streams: 0,
+            max_negotiating_outbound_streams,
             remote,
         }
     }
@@ -69,13 +67,15 @@ impl ConnectionHandler for Handler {
         cx: &mut Context<'_>,
     ) -> Poll<swarm::ConnectionHandlerEvent<Self::OutboundProtocol, NewStream, Self::ToBehaviour>>
     {
-        if self.outbound_negotiations >= MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS {
+        // The connection polls its handler again after every negotiation result, so reaching the
+        // limit needs no waker.
+        if self.negotiating_outbound_streams >= self.max_negotiating_outbound_streams.get() {
             return Poll::Pending;
         }
 
         match self.receiver.poll_next_unpin(cx) {
             Poll::Ready(Some(new_stream)) => {
-                self.outbound_negotiations += 1;
+                self.negotiating_outbound_streams += 1;
                 let supported_protocols = vec![new_stream.protocol.clone()];
                 Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest {
                     protocol: swarm::SubstreamProtocol::new(
@@ -115,7 +115,8 @@ impl ConnectionHandler for Handler {
                 protocol: (stream, actual_protocol),
                 info: new_stream,
             }) => {
-                self.outbound_negotiations = self.outbound_negotiations.saturating_sub(1);
+                self.negotiating_outbound_streams =
+                    self.negotiating_outbound_streams.saturating_sub(1);
                 debug_assert_eq!(new_stream.protocol, actual_protocol);
 
                 let _ = new_stream.sender.send(Ok(stream));
@@ -124,7 +125,8 @@ impl ConnectionHandler for Handler {
                 error,
                 info: new_stream,
             }) => {
-                self.outbound_negotiations = self.outbound_negotiations.saturating_sub(1);
+                self.negotiating_outbound_streams =
+                    self.negotiating_outbound_streams.saturating_sub(1);
                 let NewStream {
                     protocol: p,
                     sender,
@@ -165,6 +167,8 @@ mod tests {
 
     use super::*;
 
+    const MAX_NEGOTIATING_OUTBOUND_STREAMS: usize = 128;
+
     fn handler_with_requests(count: usize) -> Handler {
         let (dial_sender, _dial_receiver) = mpsc::channel(0);
         let shared = Arc::new(Mutex::new(Shared::new(dial_sender)));
@@ -178,7 +182,12 @@ mod tests {
                 })
                 .unwrap();
         }
-        Handler::new(PeerId::random(), shared, receiver)
+        Handler::new(
+            PeerId::random(),
+            shared,
+            receiver,
+            NonZeroUsize::new(MAX_NEGOTIATING_OUTBOUND_STREAMS).unwrap(),
+        )
     }
 
     fn requested_negotiations(handler: &mut Handler) -> usize {
@@ -201,11 +210,11 @@ mod tests {
 
     #[test]
     fn concurrent_negotiations_are_capped() {
-        let mut handler = handler_with_requests(MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS + 5);
+        let mut handler = handler_with_requests(MAX_NEGOTIATING_OUTBOUND_STREAMS + 5);
 
         assert_eq!(
             requested_negotiations(&mut handler),
-            MAX_CONCURRENT_OUTBOUND_NEGOTIATIONS
+            MAX_NEGOTIATING_OUTBOUND_STREAMS
         );
     }
 }
