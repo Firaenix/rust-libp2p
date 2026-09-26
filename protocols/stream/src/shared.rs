@@ -108,6 +108,27 @@ impl Shared {
         self.senders.remove(&conn);
     }
 
+    /// Another behaviour denied a connection after our handler for it was created.
+    pub(crate) fn on_connection_denied(&mut self, conn: ConnectionId) {
+        self.on_connection_closed(conn);
+    }
+
+    /// The swarm skipped our dial because its condition was false.
+    ///
+    /// If the peer is connected, requests parked for the dial would never be delivered, so they
+    /// fail instead of hanging. If a dial is merely in flight, the resulting connection picks
+    /// them up.
+    pub(crate) fn on_dial_condition_false(&mut self, peer: PeerId) {
+        if !self.connections.values().any(|p| *p == peer) {
+            return;
+        }
+
+        self.on_dial_failure(
+            peer,
+            "peer connected while a dial was pending; open the stream again".to_owned(),
+        );
+    }
+
     pub(crate) fn on_dial_failure(&mut self, peer: PeerId, reason: String) {
         let Some((_, mut receiver)) = self.pending_channels.remove(&peer) else {
             return;
@@ -168,6 +189,9 @@ impl Shared {
 
         let (sender, receiver) = mpsc::channel(0);
         self.senders.insert(connection, sender);
+        // Registered with the handler rather than on `ConnectionEstablished`, so a stream
+        // requested in between reaches this connection instead of dialling a connected peer.
+        self.connections.insert(connection, peer);
 
         receiver
     }
@@ -193,6 +217,70 @@ mod tests {
         assert_eq!(shared.senders.len(), 1);
 
         shared.on_connection_closed(conn);
+        assert!(shared.senders.is_empty());
+        assert!(shared.connections.is_empty());
+    }
+
+    #[test]
+    fn a_stream_requested_before_connection_established_uses_the_new_connection() {
+        let (dial_sender, mut dial_receiver) = mpsc::channel(1);
+        let mut shared = Shared::new(dial_sender);
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(1);
+
+        let _receiver = shared.receiver(peer, conn);
+        let _sender = shared.sender(peer);
+
+        assert!(shared.pending_channels.is_empty());
+        assert!(
+            dial_receiver.try_next().is_err(),
+            "no dial for a connected peer"
+        );
+    }
+
+    #[test]
+    fn a_skipped_dial_to_a_connected_peer_fails_parked_requests() {
+        let mut shared = shared();
+        let peer = PeerId::random();
+        let mut parked = shared.sender(peer);
+        let (sender, mut reply) = futures::channel::oneshot::channel();
+        parked
+            .try_send(NewStream {
+                protocol: StreamProtocol::new("/test"),
+                sender,
+            })
+            .unwrap();
+
+        shared.on_connection_established(ConnectionId::new_unchecked(3), peer);
+        shared.on_dial_condition_false(peer);
+
+        assert!(matches!(
+            reply.try_recv(),
+            Ok(Some(Err(crate::OpenStreamError::Io(_))))
+        ));
+        assert!(shared.pending_channels.is_empty());
+    }
+
+    #[test]
+    fn a_skipped_dial_while_another_dial_is_in_flight_keeps_parked_requests() {
+        let mut shared = shared();
+        let peer = PeerId::random();
+        let _parked = shared.sender(peer);
+
+        shared.on_dial_condition_false(peer);
+
+        assert!(shared.pending_channels.contains_key(&peer));
+    }
+
+    #[test]
+    fn a_denied_connection_leaves_nothing_behind() {
+        let mut shared = shared();
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(1);
+
+        let _receiver = shared.receiver(peer, conn);
+        shared.on_connection_denied(conn);
+
         assert!(shared.senders.is_empty());
         assert!(shared.connections.is_empty());
     }
