@@ -1,5 +1,6 @@
 use core::fmt;
 use std::{
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
@@ -22,6 +23,7 @@ use crate::{Control, handler::Handler, shared::Shared};
 pub struct Behaviour {
     shared: Arc<Mutex<Shared>>,
     dial_receiver: mpsc::Receiver<PeerId>,
+    max_negotiating_outbound_streams: NonZeroUsize,
 }
 
 impl Default for Behaviour {
@@ -37,7 +39,18 @@ impl Behaviour {
         Self {
             shared: Arc::new(Mutex::new(Shared::new(dial_sender))),
             dial_receiver,
+            max_negotiating_outbound_streams: NonZeroUsize::MIN,
         }
+    }
+
+    /// Sets how many outbound streams each connection negotiates at once; the default is 1.
+    ///
+    /// Above 1, an [`open_stream`](Control::open_stream) no longer waits a negotiation round trip
+    /// behind every request queued ahead of it, but the remote receives streams in bursts, and a
+    /// remote that accepts them slower than they arrive drops the excess.
+    pub fn with_max_negotiating_outbound_streams(mut self, max: NonZeroUsize) -> Self {
+        self.max_negotiating_outbound_streams = max;
+        self
     }
 
     /// Obtain a new [`Control`].
@@ -73,6 +86,7 @@ impl NetworkBehaviour for Behaviour {
             peer,
             self.shared.clone(),
             Shared::lock(&self.shared).receiver(peer, connection_id),
+            self.max_negotiating_outbound_streams,
         ))
     }
 
@@ -88,6 +102,7 @@ impl NetworkBehaviour for Behaviour {
             peer,
             self.shared.clone(),
             Shared::lock(&self.shared).receiver(peer, connection_id),
+            self.max_negotiating_outbound_streams,
         ))
     }
 

@@ -1,8 +1,8 @@
 ## 0.5.0-alpha
 
-- Negotiate outbound streams on a connection concurrently instead of one at a time, so an
-  `open_stream` no longer waits a round trip behind every request queued ahead of it. At most
-  128 negotiations run at once per connection.
+- Add `Behaviour::with_max_negotiating_outbound_streams` so a connection can negotiate several
+  outbound streams at once and an `open_stream` need not wait a round trip behind every request
+  queued ahead of it. The default stays one at a time.
 - Deliver streams requested while a connection is still being established to that connection,
   instead of parking them behind a dial the swarm skips and leaving them hanging. A skipped dial to
   an already-connected peer now fails its parked requests rather than stranding them.
