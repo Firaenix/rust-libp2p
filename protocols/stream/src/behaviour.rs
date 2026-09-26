@@ -12,7 +12,7 @@ use libp2p_swarm::{
     THandlerInEvent, THandlerOutEvent, ToSwarm, dial_opts::DialOpts,
 };
 use swarm::{
-    ConnectionClosed, DialError, DialFailure, behaviour::ConnectionEstablished,
+    ConnectionClosed, DialError, DialFailure, ListenFailure, behaviour::ConnectionEstablished,
     dial_opts::PeerCondition,
 };
 
@@ -108,11 +108,21 @@ impl NetworkBehaviour for Behaviour {
                     | DialError::Denied { .. }
                     | DialError::NoAddresses
                     | DialError::WrongPeerId { .. }),
-                ..
+                connection_id,
             }) => {
                 let reason = error.to_string(); // We can only forward the string repr but it is better than nothing.
 
-                Shared::lock(&self.shared).on_dial_failure(peer_id, reason)
+                let mut shared = Shared::lock(&self.shared);
+                shared.on_connection_denied(connection_id);
+                shared.on_dial_failure(peer_id, reason)
+            }
+            FromSwarm::DialFailure(DialFailure {
+                peer_id: Some(peer_id),
+                error: DialError::DialPeerConditionFalse(_),
+                ..
+            }) => Shared::lock(&self.shared).on_dial_condition_false(peer_id),
+            FromSwarm::ListenFailure(ListenFailure { connection_id, .. }) => {
+                Shared::lock(&self.shared).on_connection_denied(connection_id)
             }
             _ => {}
         }

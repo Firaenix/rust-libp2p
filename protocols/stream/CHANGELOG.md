@@ -3,6 +3,9 @@
 - Negotiate outbound streams on a connection concurrently instead of one at a time, so an
   `open_stream` no longer waits a round trip behind every request queued ahead of it. At most
   128 negotiations run at once per connection.
+- Deliver streams requested while a connection is still being established to that connection,
+  instead of parking them behind a dial the swarm skips and leaving them hanging. A skipped dial to
+  an already-connected peer now fails its parked requests rather than stranding them.
 - Fix memory leak: remove the per-connection `Sender` from `Shared::senders`
   when a connection closes. Previously every established connection leaked one
   sender entry forever, growing memory unboundedly under connection churn.
