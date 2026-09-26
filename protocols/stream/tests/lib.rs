@@ -1,9 +1,9 @@
-use std::io;
+use std::{io, num::NonZeroUsize};
 
 use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
 use libp2p_identity::PeerId;
 use libp2p_stream as stream;
-use libp2p_swarm::{StreamProtocol, Swarm};
+use libp2p_swarm::{Stream, StreamProtocol, Swarm};
 use libp2p_swarm_test::SwarmExt as _;
 use stream::OpenStreamError;
 use tracing::level_filters::LevelFilter;
@@ -79,9 +79,11 @@ async fn dial_errors_are_propagated() {
     assert_eq!("Dial error: no addresses for peer.", e.to_string());
 }
 
-#[tokio::test]
-async fn more_streams_than_the_negotiation_cap_all_open() {
-    let mut swarm1 = Swarm::new_ephemeral_tokio(|_| stream::Behaviour::new());
+async fn open_streams_at_once(
+    dialer: stream::Behaviour,
+    count: usize,
+) -> Vec<Result<Stream, OpenStreamError>> {
+    let mut swarm1 = Swarm::new_ephemeral_tokio(|_| dialer);
     let mut swarm2 = Swarm::new_ephemeral_tokio(|_| stream::Behaviour::new());
 
     let control = swarm1.behaviour().new_control();
@@ -96,11 +98,26 @@ async fn more_streams_than_the_negotiation_cap_all_open() {
     tokio::spawn(swarm1.loop_on_next());
     tokio::spawn(swarm2.loop_on_next());
 
-    let opens = (0..150).map(|_| {
+    let opens = (0..count).map(|_| {
         let mut control = control.clone();
         async move { control.open_stream(swarm2_peer_id, PROTOCOL).await }
     });
-    let opened = futures::future::join_all(opens).await;
+    futures::future::join_all(opens).await
+}
+
+#[tokio::test]
+async fn many_streams_requested_at_once_all_open_when_negotiated_one_at_a_time() {
+    let opened = open_streams_at_once(stream::Behaviour::new(), 150).await;
+
+    assert!(opened.iter().all(Result::is_ok));
+}
+
+#[tokio::test]
+async fn many_streams_requested_at_once_all_open_when_negotiated_concurrently() {
+    let dialer = stream::Behaviour::new()
+        .with_max_negotiating_outbound_streams(NonZeroUsize::new(16).unwrap());
+
+    let opened = open_streams_at_once(dialer, 150).await;
 
     assert!(opened.iter().all(Result::is_ok));
 }

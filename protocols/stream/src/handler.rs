@@ -168,62 +168,135 @@ pub struct NewStream {
 #[cfg(test)]
 mod tests {
     use futures::task::noop_waker_ref;
+    use libp2p_core::{Endpoint, Multiaddr, transport::PortUse};
+    use libp2p_swarm::{ConnectionId, NetworkBehaviour as _, StreamUpgradeError};
 
     use super::*;
-
-    const MAX_NEGOTIATING_OUTBOUND_STREAMS: usize = 128;
+    use crate::Behaviour;
 
     type Reply = oneshot::Receiver<Result<Stream, OpenStreamError>>;
 
-    fn handler_with_requests(count: usize) -> (Handler, Vec<Reply>) {
-        let (dial_sender, _dial_receiver) = mpsc::channel(0);
-        let shared = Arc::new(Mutex::new(Shared::new(dial_sender)));
-        let (mut requests, receiver) = mpsc::channel(count);
-        let mut replies = Vec::new();
-        for _ in 0..count {
-            let (sender, reply) = oneshot::channel();
-            requests
-                .try_send(NewStream {
-                    protocol: StreamProtocol::new("/test"),
-                    sender,
-                })
-                .unwrap();
-            replies.push(reply);
-        }
-        let handler = Handler::new(
-            PeerId::random(),
-            shared,
-            receiver,
-            NonZeroUsize::new(MAX_NEGOTIATING_OUTBOUND_STREAMS).unwrap(),
-        );
-        (handler, replies)
+    fn limited_to(max_negotiating_outbound_streams: usize) -> Behaviour {
+        Behaviour::new().with_max_negotiating_outbound_streams(
+            NonZeroUsize::new(max_negotiating_outbound_streams).unwrap(),
+        )
     }
 
-    fn requested_negotiations(handler: &mut Handler) -> usize {
+    fn connected_handler(mut behaviour: Behaviour) -> Handler {
+        behaviour
+            .handle_established_outbound_connection(
+                ConnectionId::new_unchecked(1),
+                PeerId::random(),
+                &Multiaddr::empty(),
+                Endpoint::Dialer,
+                PortUse::Reuse,
+            )
+            .unwrap()
+    }
+
+    fn request_stream(handler: &Handler, protocol: &'static str) -> Reply {
+        let (sender, reply) = oneshot::channel();
+        Shared::lock(&handler.shared)
+            .sender(handler.remote)
+            .try_send(NewStream {
+                protocol: StreamProtocol::new(protocol),
+                sender,
+            })
+            .unwrap();
+        reply
+    }
+
+    fn request_streams(handler: &Handler, count: usize) -> Vec<Reply> {
+        (0..count)
+            .map(|_| request_stream(handler, "/test"))
+            .collect()
+    }
+
+    fn requested_negotiations(handler: &mut Handler) -> Vec<NewStream> {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let mut requested = 0;
-        while let Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest { .. }) =
-            handler.poll(&mut cx)
+        let mut requested = Vec::new();
+        while let Poll::Ready(swarm::ConnectionHandlerEvent::OutboundSubstreamRequest {
+            protocol,
+        }) = handler.poll(&mut cx)
         {
-            requested += 1;
+            let (_, new_stream) = protocol.into_upgrade();
+            requested.push(new_stream);
         }
         requested
     }
 
-    #[test]
-    fn queued_requests_negotiate_at_the_same_time() {
-        let (mut handler, _replies) = handler_with_requests(8);
-
-        assert_eq!(requested_negotiations(&mut handler), 8);
+    fn fail_negotiation(handler: &mut Handler, new_stream: NewStream) {
+        handler.on_connection_event(ConnectionEvent::DialUpgradeError(DialUpgradeError {
+            info: new_stream,
+            error: StreamUpgradeError::NegotiationFailed,
+        }));
     }
 
     #[test]
-    fn concurrent_negotiations_are_capped() {
-        let (mut handler, _replies) = handler_with_requests(MAX_NEGOTIATING_OUTBOUND_STREAMS + 5);
+    fn a_default_behaviour_negotiates_one_stream_at_a_time() {
+        let mut handler = connected_handler(Behaviour::new());
+        let _replies = request_streams(&handler, 3);
 
-        assert_eq!(
-            requested_negotiations(&mut handler),
-            MAX_NEGOTIATING_OUTBOUND_STREAMS
-        );
+        let mut in_flight = requested_negotiations(&mut handler);
+        assert_eq!(in_flight.len(), 1);
+
+        fail_negotiation(&mut handler, in_flight.remove(0));
+        assert_eq!(requested_negotiations(&mut handler).len(), 1);
+    }
+
+    #[test]
+    fn an_opted_in_behaviour_negotiates_as_many_streams_at_once_as_it_allows() {
+        let mut handler = connected_handler(limited_to(16));
+        let _replies = request_streams(&handler, 16);
+
+        assert_eq!(requested_negotiations(&mut handler).len(), 16);
+    }
+
+    #[test]
+    fn requests_beyond_the_limit_wait_for_a_negotiation_to_settle() {
+        let mut handler = connected_handler(limited_to(4));
+        let _replies = request_streams(&handler, 10);
+
+        let mut in_flight = requested_negotiations(&mut handler);
+        assert_eq!(in_flight.len(), 4);
+        assert!(requested_negotiations(&mut handler).is_empty());
+
+        fail_negotiation(&mut handler, in_flight.remove(0));
+        assert_eq!(requested_negotiations(&mut handler).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_negotiation_answers_only_its_own_caller() {
+        let mut handler = connected_handler(limited_to(2));
+        let mut reply_a = request_stream(&handler, "/a");
+        let mut reply_b = request_stream(&handler, "/b");
+        let mut in_flight = requested_negotiations(&mut handler);
+        let b = in_flight
+            .iter()
+            .position(|new_stream| new_stream.protocol.as_ref() == "/b")
+            .unwrap();
+
+        fail_negotiation(&mut handler, in_flight.remove(b));
+
+        assert!(matches!(
+            reply_b.try_recv(),
+            Ok(Some(Err(OpenStreamError::UnsupportedProtocol(p)))) if p.as_ref() == "/b"
+        ));
+        assert!(matches!(reply_a.try_recv(), Ok(None)));
+    }
+
+    #[test]
+    fn a_request_whose_caller_stopped_waiting_is_not_negotiated() {
+        let mut handler = connected_handler(Behaviour::new());
+        drop(request_stream(&handler, "/a"));
+        drop(request_stream(&handler, "/b"));
+        let _reply_c = request_stream(&handler, "/c");
+
+        let negotiated: Vec<_> = requested_negotiations(&mut handler)
+            .into_iter()
+            .map(|new_stream| new_stream.protocol)
+            .collect();
+
+        assert_eq!(negotiated, [StreamProtocol::new("/c")]);
     }
 }
