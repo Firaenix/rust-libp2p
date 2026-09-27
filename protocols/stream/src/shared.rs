@@ -178,6 +178,10 @@ impl Shared {
         peer: PeerId,
         connection: ConnectionId,
     ) -> mpsc::Receiver<NewStream> {
+        // Registered with the handler rather than on `ConnectionEstablished`, so a stream
+        // requested in between reaches this connection instead of dialling a connected peer.
+        self.connections.insert(connection, peer);
+
         if let Some((sender, receiver)) = self.pending_channels.remove(&peer) {
             tracing::debug!(%peer, %connection, "Returning existing pending receiver");
 
@@ -189,9 +193,6 @@ impl Shared {
 
         let (sender, receiver) = mpsc::channel(0);
         self.senders.insert(connection, sender);
-        // Registered with the handler rather than on `ConnectionEstablished`, so a stream
-        // requested in between reaches this connection instead of dialling a connected peer.
-        self.connections.insert(connection, peer);
 
         receiver
     }
