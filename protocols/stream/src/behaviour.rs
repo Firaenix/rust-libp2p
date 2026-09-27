@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::{channel::mpsc, StreamExt};
-use libp2p_core::{transport::PortUse, Endpoint, Multiaddr};
+use libp2p_core::{multiaddr::Protocol, transport::PortUse, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     self as swarm, dial_opts::DialOpts, ConnectionDenied, ConnectionId, FromSwarm,
@@ -59,6 +59,10 @@ impl Behaviour {
     }
 }
 
+fn is_relayed(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| p == Protocol::P2pCircuit)
+}
+
 /// The protocol is already registered.
 #[derive(Debug)]
 pub struct AlreadyRegistered;
@@ -79,13 +83,13 @@ impl NetworkBehaviour for Behaviour {
         &mut self,
         connection_id: ConnectionId,
         peer: PeerId,
-        _: &Multiaddr,
+        local_addr: &Multiaddr,
         _: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(Handler::new(
             peer,
             self.shared.clone(),
-            Shared::lock(&self.shared).receiver(peer, connection_id),
+            Shared::lock(&self.shared).receiver(peer, connection_id, is_relayed(local_addr)),
             self.max_negotiating_outbound_streams,
         ))
     }
@@ -94,14 +98,14 @@ impl NetworkBehaviour for Behaviour {
         &mut self,
         connection_id: ConnectionId,
         peer: PeerId,
-        _: &Multiaddr,
+        addr: &Multiaddr,
         _: Endpoint,
         _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(Handler::new(
             peer,
             self.shared.clone(),
-            Shared::lock(&self.shared).receiver(peer, connection_id),
+            Shared::lock(&self.shared).receiver(peer, connection_id, is_relayed(addr)),
             self.max_negotiating_outbound_streams,
         ))
     }
@@ -111,8 +115,13 @@ impl NetworkBehaviour for Behaviour {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id,
                 connection_id,
+                endpoint,
                 ..
-            }) => Shared::lock(&self.shared).on_connection_established(connection_id, peer_id),
+            }) => Shared::lock(&self.shared).on_connection_established(
+                connection_id,
+                peer_id,
+                endpoint.is_relayed(),
+            ),
             FromSwarm::ConnectionClosed(ConnectionClosed { connection_id, .. }) => {
                 Shared::lock(&self.shared).on_connection_closed(connection_id)
             }

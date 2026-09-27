@@ -19,7 +19,7 @@ pub(crate) struct Shared {
     /// [`mpsc::Receiver`] in [`IncomingStreams`].
     supported_inbound_protocols: HashMap<StreamProtocol, mpsc::Sender<(PeerId, Stream)>>,
 
-    connections: HashMap<ConnectionId, PeerId>,
+    connections: HashMap<ConnectionId, PeerConnection>,
     senders: HashMap<ConnectionId, mpsc::Sender<NewStream>>,
 
     /// Tracks channel pairs for a peer whilst we are dialing them.
@@ -30,6 +30,12 @@ pub(crate) struct Shared {
     /// We manage this through a channel to avoid locks as part of
     /// [`NetworkBehaviour::poll`](libp2p_swarm::NetworkBehaviour::poll).
     dial_sender: mpsc::Sender<PeerId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerConnection {
+    peer: PeerId,
+    relayed: bool,
 }
 
 impl Shared {
@@ -99,8 +105,14 @@ impl Shared {
         }
     }
 
-    pub(crate) fn on_connection_established(&mut self, conn: ConnectionId, peer: PeerId) {
-        self.connections.insert(conn, peer);
+    pub(crate) fn on_connection_established(
+        &mut self,
+        conn: ConnectionId,
+        peer: PeerId,
+        relayed: bool,
+    ) {
+        self.connections
+            .insert(conn, PeerConnection { peer, relayed });
     }
 
     pub(crate) fn on_connection_closed(&mut self, conn: ConnectionId) {
@@ -119,7 +131,7 @@ impl Shared {
     /// fail instead of hanging. If a dial is merely in flight, the resulting connection picks
     /// them up.
     pub(crate) fn on_dial_condition_false(&mut self, peer: PeerId) {
-        if !self.connections.values().any(|p| *p == peer) {
+        if !self.connections.values().any(|c| c.peer == peer) {
             return;
         }
 
@@ -145,12 +157,15 @@ impl Shared {
     }
 
     pub(crate) fn sender(&mut self, peer: PeerId) -> mpsc::Sender<NewStream> {
-        let maybe_sender = self
-            .connections
-            .iter()
-            .filter_map(|(c, p)| (p == &peer).then_some(c))
-            .choose(&mut rand::thread_rng())
-            .and_then(|c| self.senders.get(c));
+        let mut rng = rand::thread_rng();
+        let peer_connections = self.connections.iter().filter(|(_, c)| c.peer == peer);
+        // Direct first, so once DCUtR adds a direct connection no new stream lands on the relay.
+        let maybe_sender = peer_connections
+            .clone()
+            .filter(|(_, c)| !c.relayed)
+            .choose(&mut rng)
+            .or_else(|| peer_connections.choose(&mut rng))
+            .and_then(|(id, _)| self.senders.get(id));
 
         match maybe_sender {
             Some(sender) => {
@@ -177,10 +192,12 @@ impl Shared {
         &mut self,
         peer: PeerId,
         connection: ConnectionId,
+        relayed: bool,
     ) -> mpsc::Receiver<NewStream> {
         // Registered with the handler rather than on `ConnectionEstablished`, so a stream
         // requested in between reaches this connection instead of dialling a connected peer.
-        self.connections.insert(connection, peer);
+        self.connections
+            .insert(connection, PeerConnection { peer, relayed });
 
         if let Some((sender, receiver)) = self.pending_channels.remove(&peer) {
             tracing::debug!(%peer, %connection, "Returning existing pending receiver");
@@ -213,8 +230,8 @@ mod tests {
         let peer = PeerId::random();
         let conn = ConnectionId::new_unchecked(1);
 
-        shared.on_connection_established(conn, peer);
-        let _receiver = shared.receiver(peer, conn);
+        shared.on_connection_established(conn, peer, false);
+        let _receiver = shared.receiver(peer, conn, false);
         assert_eq!(shared.senders.len(), 1);
 
         shared.on_connection_closed(conn);
@@ -229,7 +246,7 @@ mod tests {
         let peer = PeerId::random();
         let conn = ConnectionId::new_unchecked(1);
 
-        let _receiver = shared.receiver(peer, conn);
+        let _receiver = shared.receiver(peer, conn, false);
         let _sender = shared.sender(peer);
 
         assert!(shared.pending_channels.is_empty());
@@ -248,7 +265,7 @@ mod tests {
 
         let _parked = shared.sender(peer);
         assert_eq!(dial_receiver.try_next().unwrap(), Some(peer));
-        let _receiver = shared.receiver(peer, conn);
+        let _receiver = shared.receiver(peer, conn, false);
         let _sender = shared.sender(peer);
 
         assert!(shared.pending_channels.is_empty());
@@ -271,7 +288,7 @@ mod tests {
             })
             .unwrap();
 
-        shared.on_connection_established(ConnectionId::new_unchecked(3), peer);
+        shared.on_connection_established(ConnectionId::new_unchecked(3), peer, false);
         shared.on_dial_condition_false(peer);
 
         assert!(matches!(
@@ -298,7 +315,7 @@ mod tests {
         let peer = PeerId::random();
         let conn = ConnectionId::new_unchecked(1);
 
-        let _receiver = shared.receiver(peer, conn);
+        let _receiver = shared.receiver(peer, conn, false);
         shared.on_connection_denied(conn);
 
         assert!(shared.senders.is_empty());
@@ -312,8 +329,8 @@ mod tests {
 
         for i in 0..100 {
             let conn = ConnectionId::new_unchecked(i);
-            shared.on_connection_established(conn, peer);
-            let _receiver = shared.receiver(peer, conn);
+            shared.on_connection_established(conn, peer, false);
+            let _receiver = shared.receiver(peer, conn, false);
             shared.on_connection_closed(conn);
         }
 
