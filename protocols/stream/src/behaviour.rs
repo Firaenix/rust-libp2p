@@ -177,3 +177,176 @@ impl NetworkBehaviour for Behaviour {
         Poll::Pending
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use futures::{channel::oneshot, task::noop_waker_ref};
+    use libp2p_core::ConnectedPoint;
+    use libp2p_swarm::{ConnectionHandler as _, ConnectionHandlerEvent, Stream, StreamProtocol};
+
+    use super::*;
+    use crate::{handler::NewStream, OpenStreamError};
+
+    const STREAMS: usize = 16;
+
+    fn behaviour() -> Behaviour {
+        Behaviour::new().with_max_negotiating_outbound_streams(NonZeroUsize::new(STREAMS).unwrap())
+    }
+
+    fn direct_address() -> Multiaddr {
+        Multiaddr::empty()
+            .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
+            .with(Protocol::Tcp(4001))
+    }
+
+    fn circuit_address() -> Multiaddr {
+        direct_address()
+            .with(Protocol::P2p(PeerId::random()))
+            .with(Protocol::P2pCircuit)
+    }
+
+    fn establish(
+        behaviour: &mut Behaviour,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+        endpoint: &ConnectedPoint,
+    ) {
+        behaviour.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+            peer_id,
+            connection_id,
+            endpoint,
+            failed_addresses: &[],
+            other_established: 0,
+        }));
+    }
+
+    fn dialled(behaviour: &mut Behaviour, id: usize, peer: PeerId, address: Multiaddr) -> Handler {
+        let connection_id = ConnectionId::new_unchecked(id);
+        let handler = behaviour
+            .handle_established_outbound_connection(
+                connection_id,
+                peer,
+                &address,
+                Endpoint::Dialer,
+                PortUse::Reuse,
+            )
+            .unwrap();
+        let endpoint = ConnectedPoint::Dialer {
+            address,
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        establish(behaviour, connection_id, peer, &endpoint);
+        handler
+    }
+
+    fn accepted(
+        behaviour: &mut Behaviour,
+        id: usize,
+        peer: PeerId,
+        local_addr: Multiaddr,
+    ) -> Handler {
+        let connection_id = ConnectionId::new_unchecked(id);
+        let send_back_addr = direct_address();
+        let handler = behaviour
+            .handle_established_inbound_connection(
+                connection_id,
+                peer,
+                &local_addr,
+                &send_back_addr,
+            )
+            .unwrap();
+        let endpoint = ConnectedPoint::Listener {
+            local_addr,
+            send_back_addr,
+        };
+        establish(behaviour, connection_id, peer, &endpoint);
+        handler
+    }
+
+    fn request_streams(
+        behaviour: &Behaviour,
+        peer: PeerId,
+    ) -> Vec<oneshot::Receiver<Result<Stream, OpenStreamError>>> {
+        (0..STREAMS)
+            .map(|_| {
+                let (sender, reply) = oneshot::channel();
+                Shared::lock(&behaviour.shared)
+                    .sender(peer)
+                    .try_send(NewStream {
+                        protocol: StreamProtocol::new("/test"),
+                        sender,
+                    })
+                    .unwrap();
+                reply
+            })
+            .collect()
+    }
+
+    fn requested_negotiations(handler: &mut Handler) -> usize {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut requested = 0;
+        while let Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { .. }) =
+            handler.poll(&mut cx)
+        {
+            requested += 1;
+        }
+        requested
+    }
+
+    #[test]
+    fn new_streams_use_a_direct_connection_over_a_dialled_circuit() {
+        let mut behaviour = behaviour();
+        let peer = PeerId::random();
+        let mut relayed = dialled(&mut behaviour, 1, peer, circuit_address());
+        let mut direct = accepted(&mut behaviour, 2, peer, direct_address());
+
+        let _replies = request_streams(&behaviour, peer);
+
+        assert_eq!(requested_negotiations(&mut direct), STREAMS);
+        assert_eq!(requested_negotiations(&mut relayed), 0);
+    }
+
+    #[test]
+    fn new_streams_use_a_direct_connection_over_an_accepted_circuit() {
+        let mut behaviour = behaviour();
+        let peer = PeerId::random();
+        let mut relayed = accepted(&mut behaviour, 1, peer, circuit_address());
+        let mut direct = dialled(&mut behaviour, 2, peer, direct_address());
+
+        let _replies = request_streams(&behaviour, peer);
+
+        assert_eq!(requested_negotiations(&mut direct), STREAMS);
+        assert_eq!(requested_negotiations(&mut relayed), 0);
+    }
+
+    #[test]
+    fn a_peer_reachable_only_over_a_relay_gets_its_streams_there() {
+        let mut behaviour = behaviour();
+        let peer = PeerId::random();
+        let mut relayed = dialled(&mut behaviour, 1, peer, circuit_address());
+
+        let _replies = request_streams(&behaviour, peer);
+
+        assert_eq!(requested_negotiations(&mut relayed), STREAMS);
+        assert!(
+            behaviour.dial_receiver.try_next().is_err(),
+            "no dial for a peer connected over a relay"
+        );
+    }
+
+    #[test]
+    fn new_streams_return_to_the_circuit_once_the_direct_connection_closes() {
+        let mut behaviour = behaviour();
+        let peer = PeerId::random();
+        let mut relayed = dialled(&mut behaviour, 1, peer, circuit_address());
+        let _direct = accepted(&mut behaviour, 2, peer, direct_address());
+
+        Shared::lock(&behaviour.shared).on_connection_closed(ConnectionId::new_unchecked(2));
+        let _replies = request_streams(&behaviour, peer);
+
+        assert_eq!(requested_negotiations(&mut relayed), STREAMS);
+    }
+}
