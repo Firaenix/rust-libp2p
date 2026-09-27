@@ -240,6 +240,25 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_requested_before_a_dialled_connection_is_established_uses_it() {
+        let (dial_sender, mut dial_receiver) = mpsc::channel(1);
+        let mut shared = Shared::new(dial_sender);
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(1);
+
+        let _parked = shared.sender(peer);
+        assert_eq!(dial_receiver.try_next().unwrap(), Some(peer));
+        let _receiver = shared.receiver(peer, conn);
+        let _sender = shared.sender(peer);
+
+        assert!(shared.pending_channels.is_empty());
+        assert!(
+            dial_receiver.try_next().is_err(),
+            "no second dial for a peer whose dial just connected"
+        );
+    }
+
+    #[test]
     fn a_skipped_dial_to_a_connected_peer_fails_parked_requests() {
         let mut shared = shared();
         let peer = PeerId::random();
